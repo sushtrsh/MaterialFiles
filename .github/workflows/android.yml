@@ -1,27 +1,245 @@
 name: Android CI
 
-on: [push]
+on:
+  push:
+    branches: [ "main", "master", "feat/**", "fix/**" ]
+    tags:
+      - 'v*'
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: 'Build type'
+        required: true
+        default: 'debug'
+        type: choice
+        options:
+          - debug
+          - release
+          - both
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# ── Shared setup steps as reusable shell commands ──────────────────────────────
+# (GitHub Actions doesn't have native step reuse without composite actions,
+#  so both jobs repeat the setup steps — kept DRY via comments)
 
 jobs:
-  build:
 
+  # ────────────────────────────────────────────────────────────────────────────
+  # DEBUG BUILD
+  # Runs on: push (branch), pull_request, workflow_dispatch (debug / both)
+  # ────────────────────────────────────────────────────────────────────────────
+  build-debug:
+    name: Build (debug) · arm64
     runs-on: ubuntu-latest
+    if: |
+      github.event_name == 'push' ||
+      github.event_name == 'pull_request' ||
+      (github.event_name == 'workflow_dispatch' &&
+        (inputs.build_type == 'debug' || inputs.build_type == 'both'))
 
     steps:
-    - name: Check out repository
-      uses: actions/checkout@v4
-      with:
-        submodules: true
-    - name: Set up JDK 17
-      uses: actions/setup-java@v4
-      with:
-        distribution: 'temurin'
-        java-version: '21'
-    - name: Build with Gradle
-      run: ./gradlew assembleDebug lintVitalRelease
-    - name: Upload artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: app-debug.apk
-        path: app/build/outputs/apk/debug/app-debug.apk
-        retention-days: 10
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: gradle
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install NDK & build tools
+        run: |
+          echo "y" | $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager \
+            "ndk;30.0.16248370" \
+            "cmake;3.22.1" \
+            "build-tools;37.0.0" \
+            "platforms;android-37"
+
+      - name: Cache Gradle & build outputs
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+            ~/.gradle/configuration-cache
+            ${{ github.workspace }}/.gradle
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle', '**/gradle-wrapper.properties', '**/libs.versions.toml') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
+      - name: Build Debug APK (arm64)
+        run: |
+          ./gradlew assembleDebug \
+            -Pandroid.injected.build.abi=arm64-v8a \
+            --no-daemon \
+            --stacktrace
+
+      - name: Verify arm64-only ABI
+        run: |
+          APK_PATH=$(find app/build/outputs/apk/debug -name "*.apk" | head -1)
+          echo "📦 APK: $APK_PATH"
+          echo "📐 Size: $(du -sh "$APK_PATH" | cut -f1)"
+          echo ""
+          echo "🔍 Native libs in APK:"
+          unzip -l "$APK_PATH" | grep "\.so" || echo "  (no .so files)"
+          echo ""
+          echo "✅ ABI check:"
+          if unzip -l "$APK_PATH" | grep -q "lib/armeabi\|lib/x86\|lib/mips"; then
+            echo "  ❌ FAIL: non-arm64 ABI found!"
+            exit 1
+          else
+            echo "  ✅ PASS: arm64-v8a only"
+          fi
+
+      - name: Upload Debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: MaterialFiles-debug-arm64-${{ github.sha }}
+          path: app/build/outputs/apk/debug/*.apk
+          retention-days: 14
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # RELEASE BUILD
+  # Runs on: tag push (v*), workflow_dispatch (release / both)
+  # ────────────────────────────────────────────────────────────────────────────
+  build-release:
+    name: Build (release) · arm64
+    runs-on: ubuntu-latest
+    if: |
+      startsWith(github.ref, 'refs/tags/v') ||
+      (github.event_name == 'workflow_dispatch' &&
+        (inputs.build_type == 'release' || inputs.build_type == 'both'))
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: gradle
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install NDK & build tools
+        run: |
+          echo "y" | $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager \
+            "ndk;30.0.16248370" \
+            "cmake;3.22.1" \
+            "build-tools;37.0.0" \
+            "platforms;android-37"
+
+      - name: Cache Gradle & build outputs
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+            ~/.gradle/configuration-cache
+            ${{ github.workspace }}/.gradle
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle', '**/gradle-wrapper.properties', '**/libs.versions.toml') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-
+
+      - name: Decode keystore
+        run: |
+          echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 --decode > ${{ github.workspace }}/keystore.jks
+
+      - name: Write signing.properties
+        run: |
+          cat > signing.properties << EOF
+          storeFile=${{ github.workspace }}/keystore.jks
+          storePassword=${{ secrets.STORE_PASSWORD }}
+          keyAlias=${{ secrets.KEY_ALIAS }}
+          keyPassword=${{ secrets.KEY_PASSWORD }}
+          EOF
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
+      - name: Build Release APK (arm64, signed)
+        run: |
+          ./gradlew assembleRelease \
+            -Pandroid.injected.build.abi=arm64-v8a \
+            --no-daemon \
+            --stacktrace
+        env:
+          STORE_FILE: ${{ github.workspace }}/keystore.jks
+          STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+
+      - name: Run Lint
+        run: ./gradlew lintVitalRelease --no-daemon
+
+      - name: Upload Lint Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lint-report
+          path: app/build/reports/lint-results-vitalRelease.html
+          retention-days: 7
+
+      - name: Verify arm64-only ABI
+        run: |
+          APK_PATH=$(find app/build/outputs/apk/release -name "*.apk" | head -1)
+          echo "📦 APK: $APK_PATH"
+          echo "📐 Size: $(du -sh "$APK_PATH" | cut -f1)"
+          echo ""
+          echo "🔍 Native libs in APK:"
+          unzip -l "$APK_PATH" | grep "\.so" || echo "  (no .so files)"
+          echo ""
+          echo "✅ ABI check:"
+          if unzip -l "$APK_PATH" | grep -q "lib/armeabi\|lib/x86\|lib/mips"; then
+            echo "  ❌ FAIL: non-arm64 ABI found!"
+            exit 1
+          else
+            echo "  ✅ PASS: arm64-v8a only"
+          fi
+
+      - name: Upload Release APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: MaterialFiles-release-arm64-${{ github.sha }}
+          path: app/build/outputs/apk/release/*.apk
+          retention-days: 30
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: app/build/outputs/apk/release/*.apk
+          generate_release_notes: true
+          name: "MaterialFiles ${{ github.ref_name }} (arm64)"
+          body: |
+            ## 🎨 MaterialFiles ${{ github.ref_name }}
+
+            **Build info:**
+            - ABI: `arm64-v8a` only
+            - Material Design 3 Expressive `1.5.0`
+            - Commit: `${{ github.sha }}`
+
+            > Built via GitHub Actions
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
